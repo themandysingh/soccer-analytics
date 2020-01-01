@@ -31,6 +31,17 @@ class Match_Center_Scraping:
         self.away_starting_eleven = None
         self.home_subs = None
         self.away_subs = None
+        self.home_team_formation = None
+        self.away_team_formation = None
+
+        # Team Stats
+        self.home_stats = None
+        self.away_stats = None
+
+        # Match Events
+        self.home_events = None
+        self.away_event = None
+
 
         self.match_url = MATCH_URL
         self.driver = webdriver.Chrome('/Users/mandy/soccer-analytics/scraping/chromedriver')
@@ -39,6 +50,8 @@ class Match_Center_Scraping:
         self.stats_page_soup = self.get_stats_soup()
         self.lineups_page_soup = self.get_lineups_soup()
         self.driver.quit()
+
+        self.get_teams()
 
     def get_stats_soup(self):
         stats_button = self.driver.find_element_by_css_selector(self.STATS_BUTTON_CSS)
@@ -60,32 +73,69 @@ class Match_Center_Scraping:
         finally:
             return Soup(self.driver.page_source, "html.parser")
 
+    # Need to call this function after calling self.get_lineups()
     def get_match_events(self):
         events = self.lineups_page_soup.find('div', {'class':'timeLineEventsContainer'})
         home_events_soup = events.findAll('div', {'class': 'home'})
         away_events_soup = events.findAll('div', {'class': 'away'})
-        home_events = self.extract_event_info(home_events_soup)
-        away_events = self.extract_event_info(away_events_soup)
-        return home_events, away_events
+        self.home_events = self.extract_event_info(home_events_soup, self.home_team_name)
+        self.away_events = self.extract_event_info(away_events_soup, self.away_team_name)
     
-    def extract_event_info(self, events_soup_list):
+    def extract_event_info(self, events_soup_list, side):
+        players = None
+        subs = None
+        if side == self.home_team_name:
+            players = self.home_starting_eleven
+            subs = self.home_subs
+        else:
+            players = self.away_starting_eleven
+            subs = self.away_subs
         events = [None] * len(events_soup_list)
         event_count = 0
         for event_soup in events_soup_list:
             event = Match_Event()
+            event.team = side
             event.name = event_soup.span.text
             event.time = event_soup.find('time').text[:-1]
+            event.score = event_soup.find('div', {'class':'teamScore'}).text.strip().split('\n')[2]
+            player_number = int(event_soup.find('div', {'class':'eventPlayerInfo'}).text.strip().split('.')[0])
+            if event.name == 'Substitution':
+                sub_player_number = int(event_soup.find('div', {'class':'subOn'}).text.strip().split('.')[0])
+                event.subOn = subs[sub_player_number]
+                players[player_number].subOff = True
+                players[player_number].playerSubbedOn = subs[sub_player_number]
+                subs[sub_player_number].subOn = True
+                subs[sub_player_number].subbedOnFor = players[player_number]
+            
+            if players[player_number] == None:
+                event.player = subs[player_number]
+            else:
+                event.player = players[player_number]
+
+            self.updatePlayerEvents(event)
             events[event_count] = event
             event_count = event_count + 1
         return events
 
+    def updatePlayerEvents(self, event):
+        if event.name == 'Goal':
+            event.player.goals += 1
+        elif event.name == 'Yellow Card':
+            event.player.yc += 1
+        elif event.name == 'Red Card':
+            event.player.rc += 1
+
     def get_lineups(self):
+        self.get_team_formation()
         lineup_containers = self.lineups_page_soup.findAll('div', {'class':'matchLineupTeamContainer'})
         home_team_container = lineup_containers[0]
         away_team_container = lineup_containers[1]
-        home_starting_eleven, home_subs = self.extract_players(home_team_container, 'home')
-        away_starting_eleven, away_subs = self.extract_players(away_team_container, 'away')
-        return [home_starting_eleven, home_subs], [away_starting_eleven, away_subs]
+        home_starting_eleven, home_subs = self.extract_players(home_team_container, self.home_team_name)
+        away_starting_eleven, away_subs = self.extract_players(away_team_container, self.away_team_name)
+        self.home_starting_eleven = home_starting_eleven
+        self.home_subs = home_subs 
+        self.away_starting_eleven = away_starting_eleven
+        self.away_subs = away_subs
 
     def extract_players(self, team_container, side):
         team_container_children = team_container.findChildren(recursive=False)
@@ -101,6 +151,7 @@ class Match_Center_Scraping:
                     player = self.create_player_profile(line, position, side)
                     
                     if position == 'Substitutes':
+                        player.startingEleven = False
                         substitutes[player.number] = player
                     else:
                         starting_eleven[player.number] = player
@@ -113,8 +164,9 @@ class Match_Center_Scraping:
         player_info_divs = line.a.findAll('div')
         player.number = int(player_info_divs[0].text.split(' ')[2])
         player.name = player_info_divs[1].find('span', {'class':'name'}).text.replace(player_info_divs[1].find('span', {'class':'name'}).div.text, '')
-        player.nationality = player_info_divs[1].find('span', {'class':'playerCountry'}).text
+        player.country = player_info_divs[1].find('span', {'class':'playerCountry'}).text
         player.position = position
+        player.club = side
         if len(player_info_divs) > 3:
             player.captain = True
             if side == 'home':
@@ -132,6 +184,11 @@ class Match_Center_Scraping:
         teams = stats_table.thead.findAll("a")
         self.home_team_name = teams[0].text.strip()
         self.away_team_name = teams[1].text.strip()
+    
+    def get_team_formation(self):
+        lineups = self.lineups_page_soup.findAll('strong', {'class' : 'matchTeamFormation'})
+        self.home_team_formation = lineups[0].text
+        self.away_team_formation = lineups[1].text
 
     def get_team_stats(self):
         stats_table = self.stats_page_soup.find('tbody', {'class': 'matchCentreStatsContainer'}).parent
@@ -142,7 +199,8 @@ class Match_Center_Scraping:
             stat = stat.findAll('p', {})
             home_stats[stat[1].text] = stat[0].text
             away_stats[stat[1].text] = stat[2].text
-        return home_stats, away_stats
+        self.home_stats = home_stats
+        self.away_stats = away_stats
 
     def get_match_info(self):
         infoBar = self.stats_page_soup.find('div', {'class': 'matchInfo'})
@@ -156,11 +214,39 @@ class Match_Center_Scraping:
 if __name__ == '__main__':
 	match_center = Match_Center_Scraping('https://www.premierleague.com/match/46610')
 
-home_events, away_events = match_center.get_match_events()
-for home_event in home_events:
-    print(home_event.name, home_event.time)
+# Testing get_match_info()
+# match_center.get_match_info()
+# print(match_center.date)
+# print(match_center.referee)
+# print(match_center.stadium)
+# print(match_center.attendance)
+# print(match_center.score)
+
+# Testing get_team_stats()
+# match_center.get_team_stats()
+# for stat in match_center.home_stats:
+#     print(stat, match_center.home_stats[stat])
+# print()
+# for stat in match_center.away_stats:
+#     print(stat, match_center.away_stats[stat])
+# match_center.get_lineups()
+
+# Testing get_teams()
+# match_center.get_teams()
+# print(match_center.home_team_name, match_center.away_team_name)
+
+# Testing get_lineups()
+# match_center.get_lineups()
+# match_center.get_match_events()
+# print(match_center.home_subs[23].subbedOnFor.name)
+match_center.get_lineups()
+match_center.get_match_events()
+for home_event in match_center.home_events:
+    print(home_event.name, home_event.time, home_event.score)
 print()
 print('away stuff')
-for away_event in away_events:
-    print(away_event.name, away_event.time)
+for away_event in match_center.away_events:
+    print(away_event.name, away_event.time, away_event.score)
+
+print(match_center.home_starting_eleven[10].yc)
 
